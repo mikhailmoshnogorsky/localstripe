@@ -1095,6 +1095,10 @@ class Invoice(StripeObject):
         obj._voided = True
         obj.status_transitions['voided_at'] = int(time.time())
 
+        if obj.subscription:
+            sub = Subscription._api_retrieve(obj.subscription)
+            sub._on_first_payment_voided(obj)
+
         return obj
 
 
@@ -1893,13 +1897,14 @@ class Subscription(StripeObject):
 
     def __init__(self, customer=None, metadata=None, items=None,
                  tax_percent=None,  # deprecated
-                 # Currently unimplemented, only False works as expected:
-                 enable_incomplete_payments=False,
-                 **kwargs):
+                 enable_incomplete_payments=True,  # legacy support
+                 payment_behavior='allow_incomplete', **kwargs):
         if kwargs:
             raise UserError(400, 'Unexpected ' + ', '.join(kwargs.keys()))
 
         tax_percent = try_convert_to_float(tax_percent)
+        enable_incomplete_payments = try_convert_to_bool(
+            enable_incomplete_payments)
         try:
             assert type(customer) is str and customer.startswith('cus_')
             if tax_percent is not None:
@@ -1918,6 +1923,9 @@ class Subscription(StripeObject):
                 if item['tax_rates'] is not None:
                     assert type(item['tax_rates']) is list
                     assert all(type(tr) is str for tr in item['tax_rates'])
+            assert type(enable_incomplete_payments) is bool
+            assert payment_behavior in ('allow_incomplete',
+                                        'error_if_incomplete')
         except AssertionError:
             raise UserError(400, 'Bad request')
 
@@ -1943,10 +1951,13 @@ class Subscription(StripeObject):
         self.discount = None
         self.ended_at = None
         self.quantity = items[0]['quantity']
-        self.status = 'active'
+        self.status = 'incomplete'
         self.trial_end = None
         self.trial_start = None
         self.latest_invoice = None
+        self._enable_incomplete_payments = (
+            enable_incomplete_payments and
+            payment_behavior != 'error_if_incomplete')
 
         self._set_up_subscription_and_invoice(items[0])
         self.start = self.current_period_start
@@ -2022,16 +2033,35 @@ class Subscription(StripeObject):
             self.latest_invoice = invoice.id
             Invoice._api_pay_invoice(invoice.id)
 
+            if invoice.status == 'paid':
+                self.status = 'active'
+            elif invoice.charge:
+                if invoice.charge.status == 'failed':
+                    self.status = 'past_due'
+                # If source is SEPA, subscription starts `active` (even with
+                # `enable_incomplete_payments`), then is canceled later if the
+                # payment fails:
+                elif (invoice.charge.status == 'pending' and
+                        invoice.charge.payment_method.startswith('src_')):
+                    self.status = 'active'
+
     def _on_first_payment_success(self, invoice):
         self.status = 'active'
 
     def _on_first_payment_failure_now(self, invoice):
-        super()._api_delete(self.id)
-        raise UserError(402, invoice.charge.failure_message,
-                        {'code': invoice.charge.failure_code})
+        if not self._enable_incomplete_payments:
+            super()._api_delete(self.id)
+            raise UserError(402, invoice.charge.failure_message,
+                            {'code': invoice.charge.failure_code})
 
     def _on_first_payment_failure_later(self, invoice):
         Subscription._api_delete(self.id)
+
+    def _on_first_payment_voided(self, invoice):
+        if self._enable_incomplete_payments:
+            self.status = 'incomplete_expired'
+        else:
+            self.status = 'canceled'
 
     def _update(self, metadata=None, items=None, tax_percent=None,
                 proration_date=None,
